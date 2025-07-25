@@ -12,11 +12,16 @@ import { Provider } from "../provider/provider"
 import {
   generateText,
   streamText,
+  type JSONValue,
   type ModelMessage,
+  type GenerateTextResult,
+  type JSONSchema7,
+  type ProviderMetadata,
   type Tool as AITool,
   tool,
   wrapLanguageModel,
   type StreamTextResult,
+  LoadAPIKeyError,
   stepCountIs,
   jsonSchema,
 } from "ai"
@@ -39,11 +44,13 @@ import { Wildcard } from "../util/wildcard"
 import { MCP } from "../mcp"
 import { LSP } from "../lsp"
 import { ReadTool } from "../tool/read"
+import { Storage } from "../storage/storage"
 import { ListTool } from "../tool/ls"
 import { TaskTool } from "../tool/task"
 import { FileTime } from "../file/time"
 import { Permission } from "../permission"
 import { Snapshot } from "../snapshot"
+import { NamedError } from "../util/error"
 import { ulid } from "ulid"
 import { spawn } from "child_process"
 import { Command } from "../command"
@@ -51,13 +58,78 @@ import { $, fileURLToPath } from "bun"
 import { ConfigMarkdown } from "../config/markdown"
 import { SessionSummary } from "./summary"
 import { Config } from "@/config/config"
-import { NamedError } from "@/util/error"
 
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
   export const OUTPUT_TOKEN_MAX = 32_000
   const MAX_RETRIES = 10
   const DOOM_LOOP_THRESHOLD = 3
+
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null
+
+  const readMessageField = (value: unknown): string | undefined => {
+    if (typeof value === "string") return value
+    if (!isRecord(value)) return undefined
+    const fromMessage = value["message"]
+    if (typeof fromMessage === "string") return fromMessage
+    const fromData = value["data"]
+    if (isRecord(fromData) && typeof fromData["message"] === "string") return fromData["message"]
+    return undefined
+  }
+
+  const toErrorString = (value: unknown) => {
+    if (value instanceof Error) return value.message
+    if (typeof value === "string") return value
+    if (isRecord(value) && typeof value.message === "string") return value.message
+    return String(value)
+  }
+
+  type MCPTextPart = {
+    type: "text"
+    text: string
+  }
+
+  type MCPImagePart = {
+    type: "image"
+    data: string
+    mimeType: string
+  }
+
+  const isMCPTextPart = (value: unknown): value is MCPTextPart => {
+    if (!isRecord(value)) return false
+    if (value["type"] !== "text") return false
+    return typeof value["text"] === "string"
+  }
+
+  const isMCPImagePart = (value: unknown): value is MCPImagePart => {
+    if (!isRecord(value)) return false
+    if (value["type"] !== "image") return false
+    if (typeof value["data"] !== "string") return false
+    return typeof value["mimeType"] === "string"
+  }
+
+  function isStreamingVerificationError(input: unknown) {
+    if (!input) return false
+    const msg = readMessageField(input)
+    if (!msg) return false
+    const m = msg.toLowerCase()
+    return m.includes("must be verified to stream")
+  }
+
+  function isStreamingTimeoutError(input: unknown) {
+    if (!input) return false
+    const message = readMessageField(input)
+    if (typeof message === "string") return message.toLowerCase().includes("timed out")
+    return false
+  }
+
+  export class BusyError extends Error {
+    constructor(readonly sessionID: string) {
+      super(`Session ${sessionID} is busy`)
+      this.name = "BusyError"
+    }
+  }
 
   export const Event = {
     Idle: Bus.event(
@@ -70,6 +142,7 @@ export namespace SessionPrompt {
 
   const state = Instance.state(
     () => {
+      const pending = new Map<string, AbortController>()
       const queued = new Map<
         string,
         {
@@ -77,24 +150,185 @@ export namespace SessionPrompt {
           callback: (input: MessageV2.WithParts) => void
         }[]
       >()
-      const pending = new Set<Promise<void>>()
-
+      const tracked = new Set<Promise<void>>()
       const track = (promise: Promise<void>) => {
-        pending.add(promise)
-        promise.finally(() => pending.delete(promise))
+        tracked.add(promise)
+        promise.finally(() => tracked.delete(promise))
       }
-
       return {
-        queued,
         pending,
+        queued,
         track,
+        tracked,
       }
     },
     async (current) => {
+      for (const controller of current.pending.values()) {
+        controller.abort()
+      }
+      current.pending.clear()
       current.queued.clear()
-      await Promise.allSettled([...current.pending])
+      await Promise.allSettled([...current.tracked])
+      current.tracked.clear()
     },
   )
+
+  type ToolValue = {
+    output: string
+    metadata?: unknown
+    title?: string
+  }
+
+  type ToolExecutor = {
+    execute: (input: unknown, context: unknown) => Promise<ToolValue>
+    onInputAvailable?: (input: {
+      input: unknown
+      toolCallId: string
+      messages?: ModelMessage[]
+      abortSignal: AbortSignal
+    }) => Promise<void> | void
+  }
+
+  type ToolContextFactory = (input: {
+    update: (state: { metadata?: unknown; title?: string }) => Promise<MessageV2.ToolPart>
+  }) => Record<string, unknown>
+
+  type ToolResult =
+    | { status: "ok"; value: ToolValue; part: MessageV2.ToolPart }
+    | { status: "error"; message: string; metadata?: unknown; part: MessageV2.ToolPart }
+
+  async function executeToolCall(options: {
+    tool: ToolExecutor
+    name: string
+    callId: string
+    input: unknown
+    sessionID: string
+    messageID: string
+    abortSignal: AbortSignal
+    messages?: ModelMessage[]
+    context?: Record<string, unknown> | ToolContextFactory
+    stateInput?: unknown
+  }): Promise<ToolResult> {
+    const startedAt = Date.now()
+    const displayInput = options.stateInput ?? options.input
+    const inputRecord =
+      typeof displayInput === "object" && displayInput !== null
+        ? (displayInput as Record<string, unknown>)
+        : { value: displayInput }
+    const created = await Session.updatePart({
+      id: Identifier.ascending("part"),
+      messageID: options.messageID,
+      sessionID: options.sessionID,
+      type: "tool",
+      tool: options.name,
+      callID: options.callId,
+      state: {
+        status: "running",
+        input: inputRecord,
+        time: {
+          start: startedAt,
+        },
+      },
+    })
+    const holder = {
+      part: created as MessageV2.ToolPart,
+    }
+    const updateRunning = async (state: { metadata?: unknown; title?: string }) => {
+      if (holder.part.state.status !== "running") return holder.part
+      const next = (await Session.updatePart({
+        ...holder.part,
+        state: {
+          ...holder.part.state,
+          metadata: state.metadata ?? holder.part.state.metadata,
+          title: state.title ?? holder.part.state.title,
+        },
+      })) as MessageV2.ToolPart
+      holder.part = next
+      return next
+    }
+    const ctxBase = {
+      toolCallId: options.callId,
+      messages: options.messages,
+      abortSignal: options.abortSignal,
+      metadata: async (meta: { metadata?: unknown; title?: string }) => {
+        await updateRunning({
+          title: meta.title,
+          metadata: meta.metadata,
+        })
+      },
+    }
+    const ctxInput =
+      typeof options.context === "function"
+        ? options.context({ update: updateRunning })
+        : options.context ?? {}
+    const ctx = {
+      ...ctxBase,
+      ...ctxInput,
+    }
+    if (typeof options.tool.onInputAvailable === "function") {
+      await options.tool.onInputAvailable({
+        input: options.input,
+        toolCallId: options.callId,
+        messages: options.messages,
+        abortSignal: options.abortSignal,
+      })
+    }
+    try {
+      const value = await options.tool.execute(options.input, ctx)
+      const metadataRecord =
+        typeof value.metadata === "object" && value.metadata !== null
+          ? (value.metadata as Record<string, unknown>)
+          : {}
+      const title = value.title ?? ""
+      const next = (await Session.updatePart({
+        ...holder.part,
+        state: {
+          status: "completed",
+          input: inputRecord,
+          output: value.output,
+          metadata: metadataRecord,
+          title,
+          time: {
+            start: startedAt,
+            end: Date.now(),
+          },
+        },
+      })) as MessageV2.ToolPart
+      holder.part = next
+      return {
+        status: "ok",
+        value,
+        part: holder.part,
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const metadata = err instanceof Permission.RejectedError ? err.metadata : undefined
+      const errorMetadata =
+        typeof metadata === "object" && metadata !== null
+          ? (metadata as Record<string, unknown>)
+          : undefined
+      const next = (await Session.updatePart({
+        ...holder.part,
+        state: {
+          status: "error",
+          input: inputRecord,
+          error: message,
+          metadata: errorMetadata,
+          time: {
+            start: startedAt,
+            end: Date.now(),
+          },
+        },
+      })) as MessageV2.ToolPart
+      holder.part = next
+      return {
+        status: "error",
+        message,
+        metadata,
+        part: holder.part,
+      }
+    }
+  }
 
   export const PromptInput = z.object({
     sessionID: Identifier.schema("session"),
@@ -109,6 +343,12 @@ export namespace SessionPrompt {
     noReply: z.boolean().optional(),
     system: z.string().optional(),
     tools: z.record(z.string(), z.boolean()).optional(),
+    acpConnection: z
+      .object({
+        connection: z.any(),
+        sessionId: z.string(),
+      })
+      .optional(),
     parts: z.array(
       z.discriminatedUnion("type", [
         MessageV2.TextPart.omit({
@@ -218,13 +458,14 @@ export namespace SessionPrompt {
         state().queued.set(input.sessionID, queue)
       })
     }
+    using abort = lock(input.sessionID)
+
     const agent = await Agent.get(input.agent ?? "build")
     const model = await resolveModel({
       agent,
       model: input.model,
     }).then((x) => Provider.getModel(x.providerID, x.modelID))
-
-    using abort = lock(input.sessionID)
+    const outputLimit = Math.min(model.info.limit.output, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX
 
     const system = await resolveSystemPrompt({
       providerID: model.providerID,
@@ -240,6 +481,7 @@ export namespace SessionPrompt {
       agent: agent.name,
       system,
       abort: abort.signal,
+      acpConnection: input.acpConnection,
     })
 
     const tools = await resolveTools({
@@ -272,20 +514,467 @@ export namespace SessionPrompt {
         },
       },
     )
+    const providerDefaults = {
+      ...ProviderTransform.options(model.providerID, model.modelID, model.npm ?? "", input.sessionID),
+      ...model.info.options,
+      ...agent.options,
+    }
+    const providerBaseOptions = (() => {
+      const source =
+        params.options && typeof params.options === "object"
+          ? { ...providerDefaults, ...(params.options as Record<string, unknown>) }
+          : { ...providerDefaults }
+      return Object.entries(source).reduce<Record<string, JSONValue>>((acc, [key, value]) => {
+        if (value === undefined) return acc
+        acc[key] = value as JSONValue
+        return acc
+      }, {})
+    })()
+    type ProviderOptionMap = ReturnType<typeof ProviderTransform.providerOptions>
+    const buildProviderOptions = (stream: boolean): ProviderOptionMap => {
+      const options: Record<string, JSONValue> = { ...providerBaseOptions }
+      if (!stream) options.stream = false
+      if (options["store"] === false) options["store"] = true
+      return ProviderTransform.providerOptions(model.npm, model.providerID, options)
+    }
+
+    const isThenable = (value: unknown): value is PromiseLike<unknown> =>
+      isRecord(value) && typeof value.then === "function"
+
+    const nestedString = (value: unknown, keys: string[]): string | undefined => {
+      let current: unknown = value
+      for (const key of keys) {
+        if (!isRecord(current)) return undefined
+        current = current[key]
+      }
+      return typeof current === "string" ? current : undefined
+    }
+
+    const isLengthReason = (reason?: string) => {
+      if (!reason) return false
+      const normalized = reason.toLowerCase()
+      return normalized === "length" || normalized === "max_tokens"
+    }
+
+    const providerLengthStop = (finishReason: unknown, metadata: ProviderMetadata | undefined) => {
+      if (typeof finishReason === "string" && finishReason.toLowerCase().includes("length")) return true
+      if (!metadata || typeof metadata !== "object") return false
+      if (isLengthReason(nestedString(metadata, ["openai", "finish_reason"]))) return true
+      if (nestedString(metadata, ["anthropic", "stop_reason"]) === "max_tokens") return true
+      if (isLengthReason(nestedString(metadata, ["bedrock", "stopReason"]))) return true
+      return false
+    }
+
+    type ToolCallInfo = {
+      id: string
+      name: string
+      input: unknown
+    }
+
+    const toPassiveTools = (source: typeof tools): Record<string, AITool> => {
+      const entries: Array<[string, AITool]> = []
+      for (const [name, toolEntry] of Object.entries(source)) {
+        const clone = { ...toolEntry } as Record<string, unknown>
+        delete clone.execute
+        entries.push([name, clone as AITool])
+      }
+      return Object.fromEntries(entries)
+    }
+
+    const toToolCall = (value: unknown): ToolCallInfo | undefined => {
+      if (!isRecord(value)) return
+      const rawName = value.toolName
+      if (typeof rawName !== "string" || !rawName.length) return
+      const rawId = value.toolCallId
+      const id = typeof rawId === "string" && rawId.length ? rawId : Identifier.ascending("part")
+      const inputValue = Reflect.get(value, "input")
+      return {
+        id,
+        name: rawName,
+        input: inputValue,
+      }
+    }
+
+    const normalizeToolCallArray = async (value: unknown): Promise<ToolCallInfo[]> => {
+      if (!value) return []
+      if (Array.isArray(value)) {
+        return value
+          .map((entry) => toToolCall(entry))
+          .filter((entry): entry is ToolCallInfo => Boolean(entry))
+      }
+      if (isThenable(value)) return normalizeToolCallArray(await value)
+      return []
+    }
+
+    const collectToolCalls = async (output: unknown): Promise<ToolCallInfo[]> => {
+      if (!isRecord(output)) return []
+      const direct = await normalizeToolCallArray(output.toolCalls)
+      if (direct.length) return direct
+      const response = output.response
+      if (!isRecord(response)) return []
+      const messages = response.messages
+      if (!Array.isArray(messages)) return []
+      const result: ToolCallInfo[] = []
+      for (const message of messages) {
+        if (!isRecord(message)) continue
+        if (message.role !== "assistant") continue
+        const content = message.content
+        if (!Array.isArray(content)) continue
+        for (const part of content) {
+          if (!isRecord(part)) continue
+          if (part.type !== "tool-call") continue
+          const mapped = toToolCall(part)
+          if (mapped) result.push(mapped)
+        }
+      }
+      return result
+    }
+
+    const toolCallContent = (calls: ToolCallInfo[]) =>
+      calls.map((call) => ({
+        type: "tool-call" as const,
+        toolCallId: call.id,
+        toolName: call.name,
+        input: call.input,
+      }))
+
+    const runToolCall = async (input: {
+      call: ToolCallInfo
+      toolEntry?: ToolExecutor
+      failureCounts: Map<string, number>
+      failureLimit: number
+      sessionID: string
+      messageID: string
+      abortSignal: AbortSignal
+      messages: ModelMessage[]
+      conv: ModelMessage[]
+    }): Promise<{ finalize?: string }> => {
+      const { call } = input
+      if (!input.toolEntry) {
+        const record =
+          typeof call.input === "object" && call.input !== null
+            ? (call.input as Record<string, unknown>)
+            : { value: call.input }
+        await Session.updatePart({
+          id: Identifier.ascending("part"),
+          messageID: input.messageID,
+          sessionID: input.sessionID,
+          type: "tool",
+          tool: call.name,
+          callID: call.id,
+          state: {
+            status: "error",
+            input: record,
+            error: "Tool unavailable",
+            time: {
+              start: Date.now(),
+              end: Date.now(),
+            },
+          },
+        })
+        input.conv.push({
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: call.id,
+              toolName: call.name,
+              output: { type: "text", value: `Error: Tool ${call.name} is unavailable.` },
+            },
+          ],
+        })
+        const count = (input.failureCounts.get(call.name) ?? 0) + 1
+        input.failureCounts.set(call.name, count)
+        if (count >= input.failureLimit) {
+          return {
+            finalize: `Tool ${call.name} is unavailable. Please update the request or register the tool.`,
+          }
+        }
+        return {}
+      }
+      const outcome = await executeToolCall({
+        tool: input.toolEntry,
+        name: call.name,
+        callId: call.id,
+        input: call.input,
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        abortSignal: input.abortSignal,
+        messages: input.messages,
+      })
+      if (outcome.status === "ok") {
+        if (input.failureCounts.has(call.name)) input.failureCounts.delete(call.name)
+        input.conv.push({
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: call.id,
+              toolName: call.name,
+              output: { type: "text", value: outcome.value.output },
+            },
+          ],
+        })
+        return {}
+      }
+      input.conv.push({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: call.id,
+            toolName: call.name,
+            output: { type: "text", value: `Error: ${outcome.message}` },
+          },
+        ],
+      })
+      const nextCount = (input.failureCounts.get(call.name) ?? 0) + 1
+      input.failureCounts.set(call.name, nextCount)
+      if (nextCount >= input.failureLimit) {
+        return {
+          finalize: `Tool ${call.name} failed ${nextCount} times. Please check the request and try again.`,
+        }
+      }
+      return {}
+    }
+
+    const settle = async (result: MessageV2.WithParts & { blocked?: boolean }) => {
+      const queued = state().queued.get(input.sessionID) ?? []
+      for (const item of queued) item.callback(result)
+      state().queued.delete(input.sessionID)
+      SessionCompaction.prune(input)
+      return result
+    }
+
+    const loadConversation = async (options?: { signal?: AbortSignal }) => {
+      const history = await getMessages({
+        sessionID: input.sessionID,
+        model: model.info,
+        providerID: model.providerID,
+        signal: options?.signal,
+      })
+      const augmented = insertReminders({ messages: history, agent })
+      const systemMessages = system.map(
+        (entry): ModelMessage => ({
+          role: "system",
+          content: entry,
+        }),
+      )
+      const conversation = [...systemMessages, ...toModelConversation(augmented)]
+      const parentID = augmented.findLast((msg) => msg.info.role === "user")?.info.id ?? userMsg.info.id
+      return { history: augmented, conversation, parentID }
+    }
+
+    const upsertAssistantText = async (inputText: {
+      messageID: string
+      sessionID: string
+      text: string
+    }) => {
+      const content = inputText.text.trim()
+      if (!content.length) return
+      const parts = await MessageV2.parts(inputText.messageID)
+      const match = parts.find((part) => part.type === "text") as MessageV2.TextPart | undefined
+      if (!match) {
+        await Session.updatePart({
+          id: Identifier.ascending("part"),
+          messageID: inputText.messageID,
+          sessionID: inputText.sessionID,
+          type: "text",
+          text: content,
+        })
+        return
+      }
+      if (match.text === content) return
+      await Session.updatePart({ ...match, text: content })
+    }
+
+    const finalizeResponse = async (text?: string) => {
+      const msg = processor.message
+      const content = text?.trim()
+      if (content && content.length) {
+        await upsertAssistantText({
+          messageID: msg.id,
+          sessionID: msg.sessionID,
+          text: content,
+        })
+      }
+      await processor.end()
+      await Session.setStreamingCapable(input.sessionID, false)
+      const partsFinal = await MessageV2.parts(msg.id)
+      return settle({ info: msg, parts: partsFinal })
+    }
+
+    const clearAssistantMessage = async (msg: MessageV2.Assistant) => {
+      const parts = await MessageV2.parts(msg.id)
+      for (const part of parts) {
+        await Storage.remove(["part", msg.id, part.id])
+        await Bus.publish(MessageV2.Event.PartRemoved, {
+          sessionID: msg.sessionID,
+          messageID: msg.id,
+          partID: part.id,
+        })
+      }
+    }
+
+    async function nonStreamingFallback(options?: { replaceMessageID?: string }) {
+      if (options?.replaceMessageID) {
+        await Session.removeMessage({
+          sessionID: input.sessionID,
+          messageID: options.replaceMessageID,
+        }).catch((err) => {
+          log.warn("failed to remove streaming placeholder message", {
+            sessionID: input.sessionID,
+            messageID: options.replaceMessageID,
+            error: err,
+          })
+        })
+      }
+      const seed = await loadConversation({ signal: abort.signal })
+      const conv: ModelMessage[] = [...seed.conversation]
+      if (!processor.hasMessage()) {
+        await processor.next(seed.parentID)
+      }
+      const passiveTools = toPassiveTools(tools)
+      type PassiveToolSet = typeof passiveTools
+      type GenerateResult = GenerateTextResult<PassiveToolSet, unknown>
+      let wroteText = false
+      let awaiting = false
+      let hadTools = false
+      const failureCounts = new Map<string, number>()
+      const failureLimit = 3
+      const idleLimit = 8
+      let idleRounds = 0
+      while (true) {
+        wroteText = false
+        await processor.startStep()
+        hadTools = false
+        const request = {
+          maxOutputTokens: ProviderTransform.maxOutputTokens(
+            model.providerID,
+            params.options,
+            model.info.limit.output,
+            outputLimit,
+          ),
+          providerOptions: buildProviderOptions(false),
+          messages: ProviderTransform.message(conv, model.providerID, model.modelID),
+          temperature: params.temperature,
+          topP: params.topP,
+          tools: model.info.tool_call === false ? undefined : passiveTools,
+            model: wrapLanguageModel({
+              model: model.language,
+              middleware: [
+                {
+                  // @ts-expect-error: AI SDK does not currently export the middleware payload type.
+                  async transformParams(input: unknown) {
+                    const payload = input as {
+                      type: string
+                      params: { prompt?: ModelMessage[] | string }
+                    }
+                  if (payload.type !== "generate") return payload.params
+                  const promptValue = payload.params.prompt
+                  if (Array.isArray(promptValue)) {
+                    payload.params.prompt = ProviderTransform.message(
+                      promptValue as ModelMessage[],
+                      model.providerID,
+                      model.modelID,
+                    )
+                  }
+                  return payload.params
+                },
+              },
+            ],
+          }),
+        }
+        let out: GenerateResult | undefined
+        try {
+          out = await generateText<PassiveToolSet>(request)
+        } catch (err) {
+          const error = err instanceof Error ? err : new Error(String(err))
+          const named = LoadAPIKeyError.isInstance(error)
+            ? new MessageV2.AuthError({ providerID: model.providerID, message: error.message }, { cause: error }).toObject()
+            : new NamedError.Unknown({ message: error.message }, { cause: error }).toObject()
+          processor.message.error = named
+          return finalizeResponse()
+        }
+        const usage = out?.usage
+          ? Session.getUsage({ model: model.info, usage: out.usage, metadata: out.providerMetadata })
+          : undefined
+        if (usage) {
+          await processor.finishStep(usage)
+        }
+        const toolCalls = await collectToolCalls(out)
+        if (toolCalls.length) {
+          hadTools = true
+          conv.push({ role: "assistant", content: toolCallContent(toolCalls) })
+          const promptMessages = conv.slice()
+          awaiting = true
+
+          for (const call of toolCalls) {
+            const result = await runToolCall({
+              call,
+              toolEntry: tools[call.name] as ToolExecutor | undefined,
+              failureCounts,
+              failureLimit,
+              sessionID: processor.message.sessionID,
+              messageID: processor.message.id,
+              abortSignal: abort.signal,
+              messages: promptMessages,
+              conv,
+            })
+            if (result.finalize) return finalizeResponse(result.finalize)
+          }
+          awaiting = false
+          await processor.flushSnapshot()
+          idleRounds = 0
+          continue
+        }
+
+        const txt = typeof out?.text === "string" ? out.text : ""
+        if (txt) {
+          await upsertAssistantText({
+            messageID: processor.message.id,
+            sessionID: processor.message.sessionID,
+            text: txt,
+          })
+          conv.push({ role: "assistant", content: [{ type: "text", text: txt }] })
+          awaiting = false
+          wroteText = true
+        }
+
+        if (wroteText) idleRounds = 0
+        if (!wroteText) {
+          idleRounds += 1
+          if (idleRounds >= idleLimit) {
+            const text = "Unable to produce a response after multiple attempts. Please try again or simplify the request."
+            return finalizeResponse(text)
+          }
+        }
+
+        const lengthStop = providerLengthStop(out?.finishReason, out?.providerMetadata)
+        if (lengthStop) continue
+        if (awaiting) continue
+        if (hadTools && !wroteText) continue
+        const partsNow = await MessageV2.parts(processor.message.id)
+        const hasText = partsNow.some((pp) => pp.type === "text")
+        if (!hasText) continue
+        return finalizeResponse()
+      }
+    }
+
+    // If streaming is known to be unsupported for this session, go straight to fallback
+    const knownCapable = await Session.getStreamingCapable(input.sessionID)
+    if (knownCapable === false) {
+      return nonStreamingFallback()
+    }
 
     let step = 0
     while (true) {
-      const msgs: MessageV2.WithParts[] = pipe(
-        await getMessages({
-          sessionID: input.sessionID,
-          model: model.info,
-          providerID: model.providerID,
-          signal: abort.signal,
-        }),
-        (messages) => insertReminders({ messages, agent }),
-      )
-      step++
-      await processor.next(msgs.findLast((m) => m.info.role === "user")?.info.id!)
+      const seed = await loadConversation({ signal: abort.signal })
+      const msgs = seed.history
+      const conversation = seed.conversation
+      const parentID = seed.parentID
+      step += 1
+      await processor.next(parentID)
       if (step === 1) {
         state().track(
           ensureTitle({
@@ -341,8 +1030,6 @@ export namespace SessionPrompt {
               : undefined),
             ...model.info.headers,
           },
-          // set to 0, we handle loop
-          maxRetries: 0,
           activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
           maxOutputTokens: ProviderTransform.maxOutputTokens(
             model.npm ?? "",
@@ -351,33 +1038,13 @@ export namespace SessionPrompt {
             OUTPUT_TOKEN_MAX,
           ),
           abortSignal: abort.signal,
-          providerOptions: ProviderTransform.providerOptions(model.npm, model.providerID, params.options),
+          // set to 0, we handle retry loop manually
+          maxRetries: 0,
+          providerOptions: buildProviderOptions(true),
           stopWhen: stepCountIs(1),
           temperature: params.temperature,
           topP: params.topP,
-          messages: [
-            ...system.map(
-              (x): ModelMessage => ({
-                role: "system",
-                content: x,
-              }),
-            ),
-            ...MessageV2.toModelMessage(
-              msgs.filter((m) => {
-                if (m.info.role !== "assistant" || m.info.error === undefined) {
-                  return true
-                }
-                if (
-                  MessageV2.AbortedError.isInstance(m.info.error) &&
-                  m.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
-                ) {
-                  return true
-                }
-
-                return false
-              }),
-            ),
-          ],
+          messages: conversation,
           tools: model.info.tool_call === false ? undefined : tools,
           model: wrapLanguageModel({
             model: model.language,
@@ -426,21 +1093,21 @@ export namespace SessionPrompt {
             const stop = await SessionRetry.sleep(delayMs, abort.signal)
               .then(() => false)
               .catch((error) => {
-                let err = error
                 if (error instanceof DOMException && error.name === "AbortError") {
-                  err = new MessageV2.AbortedError(
+                  const err = new MessageV2.AbortedError(
                     { message: error.message },
                     {
                       cause: error,
                     },
                   ).toObject()
+                  result.info.error = err
+                  Bus.publish(Session.Event.Error, {
+                    sessionID: result.info.sessionID,
+                    error: result.info.error,
+                  })
+                  return true
                 }
-                result.info.error = err
-                Bus.publish(Session.Event.Error, {
-                  sessionID: result.info.sessionID,
-                  error: result.info.error,
-                })
-                return true
+                throw error
               })
 
             if (stop) break
@@ -456,6 +1123,32 @@ export namespace SessionPrompt {
           }
         }
       }
+      const infoError = result.info.role === "assistant" ? result.info.error : undefined
+      const verify = isStreamingVerificationError(infoError)
+      if (verify) {
+        await Session.setStreamingCapable(input.sessionID, false)
+        const msg = processor.message
+        await clearAssistantMessage(msg)
+        msg.error = undefined
+        msg.time.completed = undefined
+        msg.cost = 0
+        msg.tokens = {
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        }
+        await Session.updateMessage(msg)
+        const replaceMessageID = msg.id
+        processor.reset()
+        return nonStreamingFallback({ replaceMessageID })
+      }
+      const timeout = isStreamingTimeoutError(infoError)
+      if (timeout) {
+        log.info("streaming timed out, preserving streaming capability", {
+          sessionID: input.sessionID,
+        })
+      }
       await processor.end()
 
       const queued = state().queued.get(input.sessionID) ?? []
@@ -470,12 +1163,7 @@ export namespace SessionPrompt {
           continue
         }
       }
-      for (const item of queued) {
-        item.callback(result)
-      }
-      state().queued.delete(input.sessionID)
-      SessionCompaction.prune(input)
-      return result
+      return settle(result)
     }
   }
 
@@ -483,7 +1171,7 @@ export namespace SessionPrompt {
     sessionID: string
     model: ModelsDev.Model
     providerID: string
-    signal: AbortSignal
+    signal?: AbortSignal
   }) {
     let msgs = await MessageV2.filterCompacted(MessageV2.stream(input.sessionID))
     const lastAssistant = msgs.findLast((msg) => msg.info.role === "assistant")
@@ -576,14 +1264,14 @@ export namespace SessionPrompt {
       mergeDeep(await ToolRegistry.enabled(input.providerID, input.modelID, input.agent)),
       mergeDeep(input.tools ?? {}),
     )
-    for (const item of await ToolRegistry.tools(input.providerID, input.modelID)) {
-      if (Wildcard.all(item.id, enabledTools) === false) continue
-      const schema = ProviderTransform.schema(input.providerID, input.modelID, z.toJSONSchema(item.parameters))
-      tools[item.id] = tool({
-        id: item.id as any,
-        description: item.description,
-        inputSchema: jsonSchema(schema as any),
-        async execute(args, options) {
+      for (const item of await ToolRegistry.tools(input.providerID, input.modelID)) {
+        if (Wildcard.all(item.id, enabledTools) === false) continue
+        const schema = ProviderTransform.schema(input.providerID, input.modelID, z.toJSONSchema(item.parameters))
+        const schemaJSON = schema as JSONSchema7
+        tools[item.id] = tool({
+          description: item.description,
+          inputSchema: jsonSchema(schemaJSON),
+          async execute(args, options) {
           await Plugin.trigger(
             "tool.execute.before",
             {
@@ -673,21 +1361,23 @@ export namespace SessionPrompt {
 
         const textParts: string[] = []
         const attachments: MessageV2.FilePart[] = []
+        const content = Array.isArray(result.content) ? result.content : []
 
-        for (const item of result.content) {
-          if (item.type === "text") {
-            textParts.push(item.text)
-          } else if (item.type === "image") {
+        for (const entry of content) {
+          if (isMCPTextPart(entry)) {
+            textParts.push(entry.text)
+            continue
+          }
+          if (isMCPImagePart(entry)) {
             attachments.push({
               id: Identifier.ascending("part"),
               sessionID: input.sessionID,
               messageID: input.processor.message.id,
               type: "file",
-              mime: item.mimeType,
-              url: `data:${item.mimeType};base64,${item.data}`,
+              mime: entry.mimeType,
+              url: `data:${entry.mimeType};base64,${entry.data}`,
             })
           }
-          // Add support for other types if needed
         }
 
         return {
@@ -695,7 +1385,7 @@ export namespace SessionPrompt {
           metadata: result.metadata ?? {},
           output: textParts.join("\n\n"),
           attachments,
-          content: result.content, // directly return content to preserve ordering when outputting to model
+          content,
         }
       }
       item.toModelOutput = (result) => {
@@ -968,7 +1658,6 @@ export namespace SessionPrompt {
         parts,
       },
     )
-
     await Session.updateMessage(info)
     for (const part of parts) {
       await Session.updatePart(part)
@@ -978,6 +1667,20 @@ export namespace SessionPrompt {
       info,
       parts,
     }
+  }
+
+  function includeAssistantMessage(message: MessageV2.WithParts) {
+    if (message.info.role !== "assistant" || message.info.error === undefined) return true
+    if (
+      MessageV2.AbortedError.isInstance(message.info.error) &&
+      message.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
+    )
+      return true
+    return false
+  }
+
+  function toModelConversation(messages: MessageV2.WithParts[]) {
+    return MessageV2.toModelMessage(messages.filter(includeAssistantMessage))
   }
 
   function insertReminders(input: { messages: MessageV2.WithParts[]; agent: Agent.Info }) {
@@ -1007,23 +1710,65 @@ export namespace SessionPrompt {
     return input.messages
   }
 
+  function determineToolKind(toolName: string): "read" | "edit" | "other" {
+    const readTools = [
+      "read",
+      "glob",
+      "grep",
+      "list",
+      "webfetch",
+      "context7_resolve_library_id",
+      "context7_get_library_docs",
+    ]
+    const editTools = ["edit", "write", "bash"]
+
+    if (readTools.includes(toolName.toLowerCase())) return "read"
+    if (editTools.includes(toolName.toLowerCase())) return "edit"
+    return "other"
+  }
+
+  function extractLocations(toolName: string, input: Record<string, any>): { path: string }[] {
+    try {
+      switch (toolName.toLowerCase()) {
+        case "read":
+        case "edit":
+        case "write":
+          return input["filePath"] ? [{ path: input["filePath"] }] : []
+        case "glob":
+        case "grep":
+          return input["path"] ? [{ path: input["path"] }] : []
+        case "bash":
+          return []
+        case "list":
+          return input["path"] ? [{ path: input["path"] }] : []
+        default:
+          return []
+      }
+    } catch {
+      return []
+    }
+  }
+
   export type Processor = Awaited<ReturnType<typeof createProcessor>>
-  async function createProcessor(input: {
+  export async function createProcessor(input: {
     sessionID: string
     providerID: string
     model: ModelsDev.Model
     system: string[]
     agent: string
     abort: AbortSignal
+    acpConnection?: {
+      connection: any
+      sessionId: string
+    }
   }) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
     let snapshot: string | undefined
     let blocked = false
 
     async function createMessage(parentID: string) {
-      const msg: MessageV2.Info = {
+      const msg: MessageV2.Assistant = {
         id: Identifier.ascending("message"),
-        parentID,
         role: "assistant",
         mode: input.agent,
         path: {
@@ -1043,6 +1788,7 @@ export namespace SessionPrompt {
           created: Date.now(),
         },
         sessionID: input.sessionID,
+        parentID,
       }
       await Session.updateMessage(msg)
       return msg
@@ -1050,9 +1796,58 @@ export namespace SessionPrompt {
 
     let assistantMsg: MessageV2.Assistant | undefined
 
+    async function flushSnapshot() {
+      if (!snapshot || !assistantMsg) return
+      const patch = await Snapshot.patch(snapshot)
+      if (patch.files.length) {
+        await Session.updatePart({
+          id: Identifier.ascending("part"),
+          messageID: assistantMsg.id,
+          sessionID: assistantMsg.sessionID,
+          type: "patch",
+          hash: patch.hash,
+          files: patch.files,
+        })
+      }
+      snapshot = undefined
+    }
+
+    type UsageInfo = ReturnType<typeof Session.getUsage>
+
+    async function startStepInternal() {
+      if (!assistantMsg) throw new Error("call next() first before starting step")
+      if (snapshot) await flushSnapshot()
+      await Session.updatePart({
+        id: Identifier.ascending("part"),
+        messageID: assistantMsg.id,
+        sessionID: assistantMsg.sessionID,
+        type: "step-start",
+      })
+      snapshot = await Snapshot.track()
+    }
+
+    async function finishStepInternal(usage?: UsageInfo, options?: { reason?: string }) {
+      if (!assistantMsg) throw new Error("call next() first before finishing step")
+      if (!usage) return
+      assistantMsg.cost += usage.cost
+      assistantMsg.tokens = usage.tokens
+      await Session.updatePart({
+        id: Identifier.ascending("part"),
+        messageID: assistantMsg.id,
+        sessionID: assistantMsg.sessionID,
+        type: "step-finish",
+        tokens: usage.tokens,
+        cost: usage.cost,
+        reason: options?.reason ?? "completed",
+        snapshot: await Snapshot.track(),
+      })
+      await Session.updateMessage(assistantMsg)
+    }
+
     const result = {
       async end() {
         if (assistantMsg) {
+          await flushSnapshot()
           assistantMsg.time.completed = Date.now()
           await Session.updateMessage(assistantMsg)
           assistantMsg = undefined
@@ -1069,13 +1864,34 @@ export namespace SessionPrompt {
         if (!assistantMsg) throw new Error("call next() first before accessing message")
         return assistantMsg
       },
+      hasMessage() {
+        return !!assistantMsg
+      },
       partFromToolCall(toolCallID: string) {
         return toolcalls[toolCallID]
       },
-      async process(stream: StreamTextResult<Record<string, AITool>, never>, retries: { count: number; max: number }) {
+      async startStep() {
+        await startStepInternal()
+      },
+      async finishStep(usage?: UsageInfo) {
+        await finishStepInternal(usage)
+      },
+      async flushSnapshot() {
+        await flushSnapshot()
+      },
+      reset() {
+        for (const key of Object.keys(toolcalls)) delete toolcalls[key]
+        snapshot = undefined
+        blocked = false
+      },
+      async process(
+        stream: StreamTextResult<Record<string, AITool>, never>,
+        retries?: { count: number; max: number },
+      ) {
         log.info("process")
         if (!assistantMsg) throw new Error("call next() first before processing")
         let shouldRetry = false
+        const retryState = retries ?? { count: 0, max: 0 }
         try {
           let currentText: MessageV2.TextPart | undefined
           let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
@@ -1142,6 +1958,24 @@ export namespace SessionPrompt {
                   },
                 })
                 toolcalls[value.id] = part as MessageV2.ToolPart
+                if (input.acpConnection) {
+                  await input.acpConnection.connection
+                    .sessionUpdate({
+                      sessionId: input.acpConnection.sessionId,
+                      update: {
+                        sessionUpdate: "tool_call",
+                        toolCallId: value.id,
+                        title: value.toolName,
+                        kind: determineToolKind(value.toolName),
+                        status: "pending",
+                        locations: [],
+                        rawInput: {},
+                      },
+                    })
+                    .catch((err: Error) => {
+                      log.error("failed to send tool pending to ACP", { error: err })
+                    })
+                }
                 break
 
               case "tool-input-delta":
@@ -1166,9 +2000,8 @@ export namespace SessionPrompt {
                     metadata: value.providerMetadata,
                   })
                   toolcalls[value.toolCallId] = part as MessageV2.ToolPart
-
-                  const parts = await MessageV2.parts(assistantMsg.id)
-                  const lastThree = parts.slice(-DOOM_LOOP_THRESHOLD)
+                  const recent = await MessageV2.parts(assistantMsg.id)
+                  const lastThree = recent.slice(-DOOM_LOOP_THRESHOLD)
                   if (
                     lastThree.length === DOOM_LOOP_THRESHOLD &&
                     lastThree.every(
@@ -1195,6 +2028,22 @@ export namespace SessionPrompt {
                       })
                     }
                   }
+                  if (input.acpConnection) {
+                    await input.acpConnection.connection
+                      .sessionUpdate({
+                        sessionId: input.acpConnection.sessionId,
+                        update: {
+                          sessionUpdate: "tool_call_update",
+                          toolCallId: value.toolCallId,
+                          status: "in_progress",
+                          locations: extractLocations(value.toolName, value.input),
+                          rawInput: value.input,
+                        },
+                      })
+                      .catch((err: Error) => {
+                        log.error("failed to send tool in_progress to ACP", { error: err })
+                      })
+                  }
                 }
                 break
               }
@@ -1217,6 +2066,31 @@ export namespace SessionPrompt {
                     },
                   })
 
+                  if (input.acpConnection) {
+                    await input.acpConnection.connection
+                      .sessionUpdate({
+                        sessionId: input.acpConnection.sessionId,
+                        update: {
+                          sessionUpdate: "tool_call_update",
+                          toolCallId: value.toolCallId,
+                          status: "completed",
+                          content: [
+                            {
+                              type: "content",
+                              content: {
+                                type: "text",
+                                text: value.output.output,
+                              },
+                            },
+                          ],
+                          rawOutput: value.output,
+                        },
+                      })
+                      .catch((err: Error) => {
+                        log.error("failed to send tool completed to ACP", { error: err })
+                      })
+                  }
+
                   delete toolcalls[value.toolCallId]
                 }
                 break
@@ -1230,7 +2104,7 @@ export namespace SessionPrompt {
                     state: {
                       status: "error",
                       input: value.input,
-                      error: (value.error as any).toString(),
+                      error: toErrorString(value.error),
                       metadata: value.error instanceof Permission.RejectedError ? value.error.metadata : undefined,
                       time: {
                         start: match.state.time.start,
@@ -1238,6 +2112,33 @@ export namespace SessionPrompt {
                       },
                     },
                   })
+
+                  if (input.acpConnection) {
+                    await input.acpConnection.connection
+                      .sessionUpdate({
+                        sessionId: input.acpConnection.sessionId,
+                        update: {
+                          sessionUpdate: "tool_call_update",
+                          toolCallId: value.toolCallId,
+                          status: "failed",
+                          content: [
+                            {
+                              type: "content",
+                              content: {
+                                type: "text",
+                                text: `Error: ${toErrorString(value.error)}`,
+                              },
+                            },
+                          ],
+                          rawOutput: {
+                            error: toErrorString(value.error),
+                          },
+                        },
+                      })
+                      .catch((err: Error) => {
+                        log.error("failed to send tool error to ACP", { error: err })
+                      })
+                  }
 
                   if (value.error instanceof Permission.RejectedError) {
                     blocked = true
@@ -1250,14 +2151,7 @@ export namespace SessionPrompt {
                 throw value.error
 
               case "start-step":
-                snapshot = await Snapshot.track()
-                await Session.updatePart({
-                  id: Identifier.ascending("part"),
-                  messageID: assistantMsg.id,
-                  sessionID: assistantMsg.sessionID,
-                  snapshot,
-                  type: "step-start",
-                })
+                await startStepInternal()
                 break
 
               case "finish-step":
@@ -1266,33 +2160,8 @@ export namespace SessionPrompt {
                   usage: value.usage,
                   metadata: value.providerMetadata,
                 })
-                assistantMsg.cost += usage.cost
-                assistantMsg.tokens = usage.tokens
-                await Session.updatePart({
-                  id: Identifier.ascending("part"),
-                  reason: value.finishReason,
-                  snapshot: await Snapshot.track(),
-                  messageID: assistantMsg.id,
-                  sessionID: assistantMsg.sessionID,
-                  type: "step-finish",
-                  tokens: usage.tokens,
-                  cost: usage.cost,
-                })
-                await Session.updateMessage(assistantMsg)
-                if (snapshot) {
-                  const patch = await Snapshot.patch(snapshot)
-                  if (patch.files.length) {
-                    await Session.updatePart({
-                      id: Identifier.ascending("part"),
-                      messageID: assistantMsg.id,
-                      sessionID: assistantMsg.sessionID,
-                      type: "patch",
-                      hash: patch.hash,
-                      files: patch.files,
-                    })
-                  }
-                  snapshot = undefined
-                }
+                await finishStepInternal(usage, { reason: value.finishReason })
+                await flushSnapshot()
                 SessionSummary.summarize({
                   sessionID: input.sessionID,
                   messageID: assistantMsg.parentID,
@@ -1322,6 +2191,22 @@ export namespace SessionPrompt {
                       part: currentText,
                       delta: value.text,
                     })
+                  if (input.acpConnection && value.text) {
+                    await input.acpConnection.connection
+                      .sessionUpdate({
+                        sessionId: input.acpConnection.sessionId,
+                        update: {
+                          sessionUpdate: "agent_message_chunk",
+                          content: {
+                            type: "text",
+                            text: value.text,
+                          },
+                        },
+                      })
+                      .catch((err: Error) => {
+                        log.error("failed to send text delta to ACP", { error: err })
+                      })
+                  }
                 }
                 break
 
@@ -1355,14 +2240,14 @@ export namespace SessionPrompt {
             error: e,
           })
           const error = MessageV2.fromError(e, { providerID: input.providerID })
-          if (retries.count < retries.max && MessageV2.APIError.isInstance(error) && error.data.isRetryable) {
+          if (retryState.count < retryState.max && MessageV2.APIError.isInstance(error) && error.data.isRetryable) {
             shouldRetry = true
             await Session.updatePart({
               id: Identifier.ascending("part"),
               messageID: assistantMsg.id,
               sessionID: assistantMsg.sessionID,
               type: "retry",
-              attempt: retries.count + 1,
+              attempt: retryState.count + 1,
               time: {
                 created: Date.now(),
               },
@@ -1370,6 +2255,9 @@ export namespace SessionPrompt {
             })
           } else {
             assistantMsg.error = error
+            if (isStreamingVerificationError(assistantMsg.error)) {
+              await Session.setStreamingCapable(assistantMsg.sessionID, false)
+            }
             Bus.publish(Session.Event.Error, {
               sessionID: assistantMsg.sessionID,
               error: assistantMsg.error,
@@ -1382,13 +2270,13 @@ export namespace SessionPrompt {
             await Session.updatePart({
               ...part,
               state: {
-                ...part.state,
                 status: "error",
                 error: "Tool execution aborted",
                 time: {
                   start: Date.now(),
                   end: Date.now(),
                 },
+                input: {},
               },
             })
           }
@@ -1404,7 +2292,18 @@ export namespace SessionPrompt {
   }
 
   function isBusy(sessionID: string) {
-    return SessionLock.isLocked(sessionID)
+    if (SessionLock.isLocked(sessionID)) return true
+    return state().pending.has(sessionID)
+  }
+
+  export function abort(sessionID: string) {
+    const controller = state().pending.get(sessionID)
+    if (!controller) return SessionLock.abort(sessionID)
+    log.info("aborting", { sessionID })
+    if (!controller.signal.aborted) controller.abort()
+    if (state().pending.get(sessionID) === controller) state().pending.delete(sessionID)
+    SessionLock.abort(sessionID)
+    return true
   }
 
   function lock(sessionID: string) {
@@ -1412,10 +2311,33 @@ export namespace SessionPrompt {
       sessionID,
     })
     log.info("locking", { sessionID })
+    if (state().pending.has(sessionID)) {
+      handle[Symbol.dispose]()
+      throw new BusyError(sessionID)
+    }
+    const controller = new AbortController()
+    const clear = () => {
+      if (state().pending.get(sessionID) === controller) state().pending.delete(sessionID)
+    }
+    state().pending.set(sessionID, controller)
+    handle.signal.addEventListener(
+      "abort",
+      () => {
+        if (!controller.signal.aborted) controller.abort()
+        clear()
+      },
+      { once: true },
+    )
     return {
-      signal: handle.signal,
-      abort: handle.abort,
+      signal: controller.signal,
+      abort() {
+        if (!controller.signal.aborted) controller.abort()
+        clear()
+        handle.abort()
+      },
       async [Symbol.dispose]() {
+        if (!controller.signal.aborted) controller.abort()
+        clear()
         handle[Symbol.dispose]()
         log.info("unlocking", { sessionID })
 
@@ -1643,7 +2565,6 @@ export namespace SessionPrompt {
       if (value > last) last = value
     }
 
-    // Let the final placeholder swallow any extra arguments so prompts read naturally
     const withArgs = command.template.replaceAll(placeholderRegex, (_, index) => {
       const position = Number(index)
       const argIndex = position - 1
@@ -1689,7 +2610,6 @@ export namespace SessionPrompt {
 
     const agent = await Agent.get(agentName)
     let result: MessageV2.WithParts
-
     if ((agent.mode === "subagent" && command.subtask !== false) || command.subtask === true) {
       using abort = lock(input.sessionID)
 
@@ -1742,63 +2662,43 @@ export namespace SessionPrompt {
         subagent_type: agent.name,
         prompt: template,
       }
-      const toolPart: MessageV2.ToolPart = {
-        type: "tool",
-        id: Identifier.ascending("part"),
-        messageID: assistantMsg.id,
+      const callId = ulid()
+      const tool = ((await TaskTool.init()) as unknown) as ToolExecutor
+      const truncated = args.prompt.length > 100 ? args.prompt.substring(0, 97) + "..." : args.prompt
+      const outcome = await executeToolCall({
+        tool,
+        name: "task",
+        callId,
+        input: args,
         sessionID: input.sessionID,
-        tool: "task",
-        callID: ulid(),
-        state: {
-          status: "running",
-          time: {
-            start: Date.now(),
-          },
-          input: {
-            description: args.description,
-            subagent_type: args.subagent_type,
-            // truncate prompt to preserve context
-            prompt: args.prompt.length > 100 ? args.prompt.substring(0, 97) + "..." : args.prompt,
-          },
+        messageID: assistantMsg.id,
+        abortSignal: abort.signal,
+        stateInput: {
+          description: args.description,
+          subagent_type: args.subagent_type,
+          prompt: truncated,
         },
-      }
-      await Session.updatePart(toolPart)
-
-      const taskResult = await TaskTool.init().then((t) =>
-        t.execute(args, {
+        context: ({
+          update,
+        }: {
+          update: (state: { metadata?: unknown; title?: string }) => Promise<MessageV2.ToolPart>
+        }) => ({
           sessionID: input.sessionID,
           abort: abort.signal,
           agent: agent.name,
           messageID: assistantMsg.id,
           extra: {},
-          metadata: async (metadata) => {
-            if (toolPart.state.status === "running") {
-              toolPart.state.metadata = metadata.metadata
-              toolPart.state.title = metadata.title
-              await Session.updatePart(toolPart)
-            }
+          metadata: async (meta: { title?: string; metadata?: unknown }) => {
+            await update({
+              title: meta.title,
+              metadata: meta.metadata,
+            })
           },
         }),
-      )
-
+      })
       assistantMsg.time.completed = Date.now()
       await Session.updateMessage(assistantMsg)
-      if (toolPart.state.status === "running") {
-        toolPart.state = {
-          status: "completed",
-          time: {
-            ...toolPart.state.time,
-            end: Date.now(),
-          },
-          input: toolPart.state.input,
-          title: "",
-          metadata: taskResult.metadata,
-          output: taskResult.output,
-        }
-        await Session.updatePart(toolPart)
-      }
-
-      result = { info: assistantMsg, parts: [toolPart] }
+      result = { info: assistantMsg, parts: [outcome.part] }
     } else {
       result = await prompt({
         sessionID: input.sessionID,
@@ -1846,6 +2746,7 @@ export namespace SessionPrompt {
         thinkingBudget: 0,
       }
     }
+    const abortSignal = AbortSignal.timeout(15_000)
     await generateText({
       maxOutputTokens: small.info.reasoning ? 1500 : 20,
       providerOptions: ProviderTransform.providerOptions(small.npm, small.providerID, options),
@@ -1878,6 +2779,7 @@ export namespace SessionPrompt {
       ],
       headers: small.info.headers,
       model: small.language,
+      abortSignal,
     })
       .then((result) => {
         if (result.text)
@@ -1894,6 +2796,7 @@ export namespace SessionPrompt {
           })
       })
       .catch((error) => {
+        if (error instanceof DOMException && error.name === "TimeoutError") return
         log.error("failed to generate title", { error, model: small.info.id })
       })
   }

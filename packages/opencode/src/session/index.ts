@@ -34,6 +34,11 @@ export namespace Session {
     ).test(title)
   }
 
+  export const OUTPUT_TOKEN_MAX = SessionPrompt.OUTPUT_TOKEN_MAX
+  export const BusyError = SessionPrompt.BusyError
+
+
+
   export const Info = z
     .object({
       id: Identifier.schema("session"),
@@ -68,6 +73,7 @@ export namespace Session {
           diff: z.string().optional(),
         })
         .optional(),
+      streamingCapable: z.boolean().optional(),
     })
     .meta({
       ref: "Session",
@@ -115,6 +121,18 @@ export namespace Session {
       z.object({
         sessionID: z.string().optional(),
         error: MessageV2.Assistant.shape.error,
+      }),
+    ),
+    Idle: Bus.event(
+      "session.idle",
+      z.object({
+        sessionID: z.string(),
+      }),
+    ),
+    Compacted: Bus.event(
+      "session.compacted",
+      z.object({
+        sessionID: z.string(),
       }),
     ),
   }
@@ -415,12 +433,17 @@ export namespace Session {
       }
     },
   )
-
-  export class BusyError extends Error {
-    constructor(public readonly sessionID: string) {
-      super(`Session ${sessionID} is busy`)
-    }
+  export async function getStreamingCapable(sessionID: string): Promise<boolean | undefined> {
+    const s = await get(sessionID)
+    return s?.streamingCapable
   }
+
+  export async function setStreamingCapable(sessionID: string, v: boolean): Promise<void> {
+    await update(sessionID, (d) => {
+      d.streamingCapable = v
+    })
+  }
+
 
   export const initialize = fn(
     z.object({

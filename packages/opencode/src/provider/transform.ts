@@ -1,8 +1,17 @@
-import type { ModelMessage } from "ai"
+import type { JSONValue, ModelMessage } from "ai"
 import { unique } from "remeda"
 import type { JSONSchema } from "zod/v4/core"
 
 export namespace ProviderTransform {
+  type ProviderOptionMap = Record<string, Record<string, JSONValue>>
+
+  const toJSONOptionRecord = (input: { [x: string]: unknown }): Record<string, JSONValue> => {
+    return Object.entries(input).reduce<Record<string, JSONValue>>((acc, [key, value]) => {
+      if (value === undefined) return acc
+      acc[key] = value as JSONValue
+      return acc
+    }, {})
+  }
   function normalizeMessages(msgs: ModelMessage[], providerID: string, modelID: string): ModelMessage[] {
     if (modelID.includes("claude")) {
       return msgs.map((msg) => {
@@ -162,24 +171,29 @@ export namespace ProviderTransform {
     return result
   }
 
-  export function providerOptions(npm: string | undefined, providerID: string, options: { [x: string]: any }) {
+  export function providerOptions(
+    npm: string | undefined,
+    providerID: string,
+    options: { [x: string]: unknown },
+  ): ProviderOptionMap {
+    const normalized = toJSONOptionRecord(options)
     switch (npm) {
       case "@ai-sdk/openai":
       case "@ai-sdk/azure":
         return {
-          ["openai" as string]: options,
+          ["openai" as string]: normalized,
         }
       case "@ai-sdk/amazon-bedrock":
         return {
-          ["bedrock" as string]: options,
+          ["bedrock" as string]: normalized,
         }
       case "@ai-sdk/anthropic":
         return {
-          ["anthropic" as string]: options,
+          ["anthropic" as string]: normalized,
         }
       default:
         return {
-          [providerID]: options,
+          [providerID]: normalized,
         }
     }
   }
